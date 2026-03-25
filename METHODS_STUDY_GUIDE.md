@@ -1,5 +1,35 @@
 # Museums Combined Notebook — Methods Study Guide
 
+## Start Here (Non-Coder Friendly)
+
+If you have never touched code before, read this section first.
+
+- Think of this project as two tools working together:
+- the notebook (`MuseumNotes_combined.ipynb`) is for analysis and charts,
+- the script (`find_new_museum_data.py`) is for finding only new records.
+- A **dataset** is just a table of rows and columns (like a spreadsheet).
+- A **schema** means the column names and column meanings.
+- The project takes incoming data that may not match our schema, reshapes it, checks quality, then compares it to the baseline list.
+- Final output is a CSV containing only records that were not already in baseline.
+
+### What problem this solves in plain language
+
+Without this workflow, a person would manually copy/paste rows, rename columns by hand, and guess which rows are duplicates.
+This project automates that safely:
+
+1. read incoming data from file/web,
+2. align columns into a common format,
+3. handle missing or messy values,
+4. compare against baseline,
+5. export only the truly new rows.
+
+### What you can do even if you do not code
+
+- Run one command and answer prompts.
+- Review row counts printed at the end.
+- Open the output CSV and verify the records look correct.
+- Share the output file with your team.
+
 ## Important Before You Start (Quick Essentials)
 
 - **Required files in the same project area:** `museums.csv`, `alternatemuseums.csv`, and `state_pop_data.csv`.
@@ -19,6 +49,29 @@ The design goal was reliability + explainability: clear schema mapping, explicit
 ## Goal
 
 This guide explains the methods used in `MuseumNotes_combined.ipynb` so you can study both **what** each stage does and **why** it is done that way.
+
+## Quick glossary (plain English)
+
+- **Baseline:** the reference file we compare against (`museums.csv`).
+- **Incoming source:** the new dataset we want to evaluate.
+- **Mapping:** matching source columns to required project columns.
+- **Missing value:** blank/unknown data (`NA` in tables).
+- **Duplicate detection:** checking if a record already exists using a comparison key.
+- **Key fields:** the minimum columns required to identify a record (`Museum Name` + state).
+- **Output contract:** the rules that define what gets written to the output CSV.
+
+## How the commented script matches this guide
+
+Open `find_new_museum_data.py` and read in this order:
+
+1. Module docstring at top: purpose, quick test commands, design notes.
+2. Input parsing helpers: source reading + fallback parsers.
+3. Schema mapping functions: standard, alternate, and manual interactive mapping.
+4. Duplicate-key functions: normalization + new-record filtering.
+5. `main()`: full flow from arguments to output CSV.
+
+This structure is intentional so a reader can go section-by-section in the guide,
+then find the matching code section immediately.
 
 ## 1) Multi-source ingestion
 
@@ -164,84 +217,115 @@ You can trace a row from raw input -> cleaned/mapped schema -> `clean_copy` -> g
 
 ## 12) Companion script guide: finding new records and writing a CSV
 
-The project includes `find_new_museum_data.py` to detect **new museum records** relative to baseline `museums.csv` and export only new rows.
+The required script for incremental ingestion is `find_new_museum_data.py`.
+It compares an incoming source to baseline `museums.csv` and writes only unseen rows.
 
-### What the script does
+### What we implemented (important features)
 
-1. Loads baseline data from `museums.csv` (or `--base`).
-2. Ingests incoming data from one of these sources:
+- Multi-source ingestion: local file, direct URL, `catalog.data.gov/dataset/...` page, or `data.gov` search mode.
+- Layered parsing fallback for messy sources: CSV strict -> CSV auto-delimiter -> CSV skip-bad-lines -> JSON -> HTML table.
+- ZIP support: reads CSV/JSON members inside archive sources.
+- Schema mapping paths:
+  - standard museums schema,
+  - alternate DC schema,
+  - **interactive manual mapping** for unknown schemas.
+- Interactive manual mapping now does all of the following:
+  - lists available headers,
+  - lets user choose which columns to keep,
+  - prompts for required/optional field mapping,
+  - asks for default state if no state column is selected,
+  - keeps selected extra columns in output.
+- Duplicate detection remains explainable: normalized `Museum Name + State (Administrative Location)` key.
 
-- local path,
-- direct URL,
-- `catalog.data.gov/dataset/...` dataset page URL,
-- or `data.gov` search query mode.
+### Engineer replication runbook (step-by-step)
 
-1. Maps incoming records into supported schema.
+1. Open a terminal in the project directory that contains:
 
-2. Builds duplicate key: `Museum Name + State (Administrative Location)` (normalized case/whitespace).
+- `find_new_museum_data.py`
+- `museums.csv` (baseline)
+- optional incoming files (`alternatemuseums.csv` or your own source)
 
-3. Keeps only rows with required key fields that are not already in baseline.
+1. Use a Python environment with `pandas` installed.
 
-4. Writes new rows to output CSV.
+2. Run one of these commands:
 
-### Input modes
+- Prompt mode: `python find_new_museum_data.py`
+- Known local file: `python find_new_museum_data.py --incoming alternatemuseums.csv --output new_museum_records.csv`
+- Catalog dataset page: `python find_new_museum_data.py --incoming "https://catalog.data.gov/dataset/public-library-survey-pls-2022" --output new_museum_records.csv`
+- Search mode: `python find_new_museum_data.py --search-query "museum dataset" --max-datasets 10 --output new_museum_records.csv`
 
-- **Prompt mode (asks for URL/path):** `python find_new_museum_data.py`
-- **Direct incoming source:** `python find_new_museum_data.py --incoming "https://example.org/museums.csv"`
-- **Catalog dataset page URL:**
-`python find_new_museum_data.py --incoming "https://catalog.data.gov/dataset/public-library-survey-pls-2022"`
-- **Search mode (`data.gov` API):**
-`python find_new_museum_data.py --search-query "museum dataset" --max-datasets 10`
+1. For unknown schemas, follow prompts:
+
+- select columns to keep,
+- map `Museum Name` (required),
+- map state/type/address if present,
+- provide default state if needed.
+
+1. Verify terminal summary:
+
+- baseline rows,
+- incoming rows,
+- new rows written,
+- output file path.
+
+### Super-simple run path (first-time user)
+
+If you only want the easiest path, do this:
+
+1. Open terminal in the project folder.
+2. Run: `python find_new_museum_data.py`
+3. Paste a URL or type a local file path when prompted.
+4. If you see header prompts, pick column numbers as requested.
+5. Wait for final summary and note the output CSV location.
+6. Open the CSV in spreadsheet software and review rows.
+
+### Safe loop for testing your own code changes
+
+Use this loop when you change the script and want quick validation:
+
+1. Make one small code change.
+2. Run a known-source test:
+
+- `python find_new_museum_data.py --incoming alternatemuseums.csv --output new_museum_records_test.csv`
+
+1. Confirm the script reaches final summary and writes output.
+2. Run an unknown-schema/manual test if you changed mapping logic.
+3. Compare output row counts before/after your change.
+4. Keep the change only if behavior is improved and expected.
+
+### What we validated in this implementation pass
+
+- Known-schema run completed using `alternatemuseums.csv` and wrote new records successfully.
+- Unknown-schema run completed using a custom CSV and exercised interactive header selection + manual mapping prompts.
+- In both runs, script reached final summary and wrote output CSV without runtime errors.
 
 ### Key arguments
 
 - `--base`: baseline CSV path (default `museums.csv`)
 - `--incoming`: URL or local path for incoming data
-- `--search-query`: online query for `data.gov` dataset discovery
+- `--search-query`: online query for `data.gov` discovery mode
 - `--max-datasets`: max datasets to inspect in search mode
 - `--output`: destination CSV for new records (default `new_museum_records.csv`)
 
-### Schema + parsing behavior
+### Output contract
 
-- Supported incoming schemas:
-- museums-style schema (has `Museum Name` and `State (Administrative Location)`),
-- alternate DC schema (`DCGISPLACE_NAMES_PTNAME`, `DCGISADDRESSES_PTADDRESS`, `MARVW_PLACE_NAME_CATEGORIESCATEGORY`).
-- For non-raw URLs and messy files, parser attempts are layered:
-- CSV (strict),
-- CSV (auto delimiter),
-- CSV (auto delimiter + skip bad lines),
-- JSON,
-- HTML table extraction.
-- If all attempts fail, script returns a detailed parse diagnostic.
-
-### Catalog.data.gov page support
-
-- If `--incoming` is a `catalog.data.gov/dataset/...` page URL, the script:
-
-1. extracts dataset id,
-2. calls CKAN `package_show`,
-3. collects CSV/JSON resource URLs,
-4. processes those resources through the same schema mapping + dedupe flow.
-
-### What gets written
-
-- Output CSV contains only rows that:
-- have non-empty normalized `Museum Name` and `State (Administrative Location)`, and
-- are not already in baseline by normalized key.
-- Script prints baseline count, incoming source label, incoming row count, new-row count, and output location.
-
-### Practical caveats
-
-- Many online datasets are non-museum schemas; those resources are skipped.
-- Network/API instability can affect URL and search modes.
-- Duplicate detection is intentionally simple for explainability; production matching can extend keying with address/fuzzy matching.
+- Output CSV contains only rows that have non-empty normalized `Museum Name` and `State (Administrative Location)`.
+- Rows already present in baseline by normalized key are excluded.
+- Script prints run metadata for reproducibility and auditability.
 
 ### Troubleshooting quick list
 
-- **No new rows:** incoming records may already exist in baseline or key fields may be empty.
-- **Schema not recognized:** incoming columns do not match supported schemas.
-- **Page URL parse issue:** confirm URL is a dataset page and resources are public.
-- **Sparse search results:** tune `--search-query` and increase `--max-datasets`.
+- **No new rows:** records may already exist in baseline or key fields are blank.
+- **Prompt asks for manual mapping:** incoming schema is not recognized automatically (expected behavior).
+- **Page URL parse issue:** verify URL is a public dataset page with CSV/JSON resources.
+- **Sparse search results:** tune `--search-query` and/or increase `--max-datasets`.
+
+### Non-coder troubleshooting (decision guide)
+
+- If you see prompts asking for column numbers, this is normal for unknown schemas.
+- If output has `0` new rows, first check whether the incoming data is already in baseline.
+- If a URL fails, try downloading that data locally and pass the local file instead.
+- If columns look wrong in output, rerun and choose different mapping columns.
 
 ## 13) 2-minute live demo script (say this in the meeting)
 

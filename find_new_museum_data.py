@@ -1,10 +1,43 @@
 from __future__ import annotations
 
+"""
+Museum incremental-ingestion helper.
+
+Purpose
+-------
+Compare an incoming museum-like data source against baseline `museums.csv`
+and export only rows that are new by normalized `Museum Name + State` key.
+
+Read vs Test workflow
+---------------------
+1) Read the code top-to-bottom by section headers:
+     - Input parsing and source loading
+     - Schema mapping
+     - Duplicate-key comparison
+     - CLI orchestration in `main()`
+
+2) Test quickly from the project directory:
+     - Prompt mode:
+         python find_new_museum_data.py
+     - Known local schema:
+         python find_new_museum_data.py --incoming alternatemuseums.csv --output new_museum_records.csv
+     - Online catalog page:
+         python find_new_museum_data.py --incoming "https://catalog.data.gov/dataset/public-library-survey-pls-2022"
+
+Design notes
+------------
+- Uses simple, explainable duplicate logic for team clarity.
+- Uses layered parsers to handle real-world sources that are inconsistent.
+- Falls back to interactive manual mapping when schema is unknown.
+"""
+
 import argparse
+from io import BytesIO
 import json
 from pathlib import Path
 from urllib.parse import quote_plus, urlparse
 from urllib.request import urlopen
+from zipfile import ZipFile
 
 import pandas as pd
 
@@ -24,6 +57,7 @@ SUPPORTED_RESOURCE_FORMATS = {"csv", "json"}
 
 
 def normalize_text(series: pd.Series) -> pd.Series:
+    """Normalize text for comparison-safe keys (trim, uppercase, fill empty)."""
     return (
         series.astype("string")
         .str.strip()
@@ -32,12 +66,209 @@ def normalize_text(series: pd.Series) -> pd.Series:
     )
 
 
+def _print_columns(columns: list[str]) -> None:
+    """Display available incoming headers as numbered options."""
+    print("\nAvailable headers:")
+    for idx, name in enumerate(columns, start=1):
+        print(f"  {idx:>2}. {name}")
+
+
+def _prompt_select_columns(columns: list[str]) -> list[str]:
+    """Prompt user to keep all columns or a chosen subset by index."""
+    _print_columns(columns)
+    print(
+        "\nChoose which columns to keep (comma-separated numbers), or press Enter to keep all."
+    )
+
+    while True:
+        raw = input("Columns to keep: ").strip()
+        if not raw:
+            return columns
+
+        try:
+            indexes = [int(part.strip()) for part in raw.split(",") if part.strip()]
+        except ValueError:
+            print("Please enter valid numbers separated by commas.")
+            continue
+
+        if not indexes:
+            print("Please choose at least one column.")
+            continue
+
+        if any(idx < 1 or idx > len(columns) for idx in indexes):
+            print("One or more selections are out of range. Try again.")
+            continue
+
+        selected = [columns[idx - 1] for idx in indexes]
+        # Preserve order while deduplicating.
+        deduped = list(dict.fromkeys(selected))
+        return deduped
+
+
+def _prompt_pick_field(
+    field_name: str,
+    columns: list[str],
+    required: bool,
+) -> str | None:
+    """Prompt user to map one required/optional target field to an input column."""
+    req_text = "required" if required else "optional"
+    print(f"\nSelect the column for '{field_name}' ({req_text}).")
+    _print_columns(columns)
+
+    while True:
+        raw = input(f"{field_name} column number{' (blank to skip)' if not required else ''}: ").strip()
+        if not raw and not required:
+            return None
+        if not raw and required:
+            print(f"{field_name} is required. Please select a column.")
+            continue
+        try:
+            idx = int(raw)
+        except ValueError:
+            print("Please enter a valid number.")
+            continue
+        if idx < 1 or idx > len(columns):
+            print("Selection out of range. Try again.")
+            continue
+        return columns[idx - 1]
+
+
+def _prompt_default_state() -> str:
+    """Require a default state when incoming source has no state column."""
+    print("\nNo state column selected.")
+    while True:
+        value = input("Enter a default state value to use (e.g., DC): ").strip()
+        if value:
+            return value
+        print("Default state is required to continue.")
+
+
+def manual_map_incoming_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    """
+    Interactive fallback mapping for unknown schemas.
+
+    This path is intentionally explicit and beginner-friendly: user sees headers,
+    picks what to keep, maps core fields, and can supply a default state.
+    """
+    print("\nSchema not recognized automatically.")
+    print("You can choose headers to keep and map them to required fields.")
+
+    all_columns = list(frame.columns)
+    kept_columns = _prompt_select_columns(all_columns)
+    working = frame[kept_columns].copy()
+
+    name_col = _prompt_pick_field("Museum Name", kept_columns, required=True)
+    state_col = _prompt_pick_field(
+        "State (Administrative Location)", kept_columns, required=False
+    )
+    type_col = _prompt_pick_field("Museum Type", kept_columns, required=False)
+    address_col = _prompt_pick_field(
+        "Street Address (Administrative Location)", kept_columns, required=False
+    )
+
+    if state_col is None:
+        default_state = _prompt_default_state()
+        state_values = pd.Series(default_state, index=working.index)
+    else:
+        state_values = working[state_col]
+
+    mapped = pd.DataFrame(
+        {
+            "Museum Name": working[name_col],
+            "State (Administrative Location)": state_values,
+            "Museum Type": working[type_col] if type_col else pd.NA,
+            "Street Address (Administrative Location)": (
+                working[address_col] if address_col else pd.NA
+            ),
+            "Institution Name": pd.NA,
+            "Tax Period": pd.NA,
+            "Income": pd.NA,
+            "Revenue": pd.NA,
+        }
+    )
+
+    # Keep user-selected extra columns so they remain available in output if useful.
+    extra_cols = [
+        col
+        for col in kept_columns
+        if col not in {name_col, state_col, type_col, address_col}
+    ]
+    if extra_cols:
+        mapped = pd.concat([mapped, working[extra_cols].copy()], axis=1)
+
+    print("\nManual mapping complete. Continuing with duplicate detection.")
+    return mapped
+
+
 def is_url(value: str) -> bool:
+    """Return True when source is an HTTP(S) URL."""
     return value.startswith("http://") or value.startswith("https://")
 
 
+def read_zip_source(source: str) -> pd.DataFrame:
+    """Read ZIP source and parse first usable CSV/JSON member(s)."""
+    if is_url(source):
+        with urlopen(source) as response:
+            zip_bytes = response.read()
+    else:
+        zip_bytes = Path(source).read_bytes()
+
+    parse_errors: list[str] = []
+
+    with ZipFile(BytesIO(zip_bytes)) as zf:
+        members = [name for name in zf.namelist() if not name.endswith("/")]
+
+        csv_members = [name for name in members if name.lower().endswith(".csv")]
+        json_members = [name for name in members if name.lower().endswith(".json")]
+
+        parsed_frames: list[pd.DataFrame] = []
+
+        for member in csv_members:
+            try:
+                with zf.open(member) as fh:
+                    frame = pd.read_csv(fh, low_memory=False)
+                if not frame.empty:
+                    parsed_frames.append(frame)
+            except Exception as exc:
+                parse_errors.append(f"{member}: {exc}")
+
+        if parsed_frames:
+            combined = pd.concat(parsed_frames, ignore_index=True, sort=False)
+            print(f"ZIP members detected: {len(members):,}")
+            print(f"CSV members parsed: {len(parsed_frames):,}")
+            return combined
+
+        for member in json_members:
+            try:
+                with zf.open(member) as fh:
+                    frame = pd.read_json(fh)
+                if not frame.empty:
+                    return frame
+            except Exception as exc:
+                parse_errors.append(f"{member}: {exc}")
+
+    summary = "\n- " + "\n- ".join(parse_errors[:8]) if parse_errors else ""
+    raise ValueError(
+        "ZIP source was found, but no CSV/JSON members could be parsed."
+        f"\nSource: {source}"
+        f"\nParse attempts:{summary}"
+    )
+
+
 def read_table(source: str) -> pd.DataFrame:
+    """
+    Parse incoming source using resilient fallbacks.
+
+    Order of attempts:
+    1) ZIP member parsing (if `.zip` appears in source)
+    2) CSV variants (strict, auto-delimiter, skip-bad-lines)
+    3) JSON
+    4) HTML table extraction
+    """
     source_lower = source.lower()
+
+    if ".zip" in source_lower:
+        return read_zip_source(source)
 
     if source_lower.endswith(".json"):
         return pd.read_json(source)
@@ -46,9 +277,8 @@ def read_table(source: str) -> pd.DataFrame:
 
     csv_attempts = [
         {"low_memory": False},
-        {"low_memory": False, "engine": "python", "sep": None},
+        {"engine": "python", "sep": None},
         {
-            "low_memory": False,
             "engine": "python",
             "sep": None,
             "on_bad_lines": "skip",
@@ -88,6 +318,7 @@ def read_table(source: str) -> pd.DataFrame:
 
 
 def search_data_gov_resources(query: str, max_datasets: int) -> list[str]:
+    """Search data.gov (CKAN) and collect CSV/JSON resource URLs."""
     api_url = (
         "https://catalog.data.gov/api/3/action/package_search"
         f"?q={quote_plus(query)}&rows={max_datasets}"
@@ -113,6 +344,7 @@ def search_data_gov_resources(query: str, max_datasets: int) -> list[str]:
 
 
 def extract_dataset_id_from_data_gov_url(url: str) -> str | None:
+    """Extract dataset id from catalog.data.gov dataset-page URL, if present."""
     parsed = urlparse(url)
     host = parsed.netloc.lower()
     path_parts = [part for part in parsed.path.strip("/").split("/") if part]
@@ -127,6 +359,7 @@ def extract_dataset_id_from_data_gov_url(url: str) -> str | None:
 
 
 def resources_from_data_gov_dataset_id(dataset_id: str) -> list[str]:
+    """Resolve a dataset id to CSV/JSON resource URLs via CKAN package_show."""
     api_url = (
         "https://catalog.data.gov/api/3/action/package_show"
         f"?id={quote_plus(dataset_id)}"
@@ -153,6 +386,7 @@ def resources_from_data_gov_dataset_id(dataset_id: str) -> list[str]:
 
 
 def load_and_map_from_data_gov_dataset_url(dataset_url: str) -> pd.DataFrame:
+    """Load all compatible resources from a catalog dataset page and map them."""
     dataset_id = extract_dataset_id_from_data_gov_url(dataset_url)
     if not dataset_id:
         raise ValueError(f"Could not extract dataset id from URL: {dataset_url}")
@@ -185,6 +419,7 @@ def load_and_map_from_data_gov_dataset_url(dataset_url: str) -> pd.DataFrame:
 
 
 def load_standard(path: Path) -> pd.DataFrame:
+    """Load baseline museums CSV and verify required key columns exist."""
     frame = pd.read_csv(path, low_memory=False)
     missing = STANDARD_REQUIRED - set(frame.columns)
     if missing:
@@ -195,6 +430,14 @@ def load_standard(path: Path) -> pd.DataFrame:
 
 
 def map_incoming_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    """
+    Map incoming frame into project schema.
+
+    Flow:
+    - If already standard schema, return as-is.
+    - If alternate DC schema, map known columns.
+    - Otherwise, use interactive manual mapping.
+    """
 
     if STANDARD_REQUIRED.issubset(frame.columns):
         return frame
@@ -216,13 +459,11 @@ def map_incoming_frame(frame: pd.DataFrame) -> pd.DataFrame:
         )
         return mapped
 
-    raise ValueError(
-        "Incoming file schema not recognized. Expected either museums.csv-like columns "
-        "or alternatemuseums.csv-like columns."
-    )
+    return manual_map_incoming_frame(frame)
 
 
 def load_and_map_incoming_source(source: str) -> pd.DataFrame:
+    """Load one source and map it to target schema (handles dataset-page URLs)."""
     dataset_id = extract_dataset_id_from_data_gov_url(source) if is_url(source) else None
     if dataset_id:
         return load_and_map_from_data_gov_dataset_url(source)
@@ -232,6 +473,7 @@ def load_and_map_incoming_source(source: str) -> pd.DataFrame:
 
 
 def load_and_map_from_data_gov_search(query: str, max_datasets: int) -> pd.DataFrame:
+    """Search data.gov, load discovered resources, and combine mapped frames."""
     urls = search_data_gov_resources(query=query, max_datasets=max_datasets)
     if not urls:
         raise ValueError("No CSV/JSON resources found from data.gov search results.")
@@ -258,6 +500,7 @@ def load_and_map_from_data_gov_search(query: str, max_datasets: int) -> pd.DataF
 
 
 def prompt_for_incoming_source() -> str:
+    """Prompt for incoming URL/path in interactive mode when --incoming is omitted."""
     print("No incoming source provided.")
     print("Enter a URL (preferred) or a local file path for incoming museum data.")
     print("Examples:")
@@ -276,6 +519,7 @@ def prompt_for_incoming_source() -> str:
 
 
 def build_match_key(frame: pd.DataFrame) -> pd.Series:
+    """Build normalized duplicate key from museum name + state."""
     names = normalize_text(frame.get("Museum Name", pd.Series(dtype="string")))
     states = normalize_text(
         frame.get("State (Administrative Location)", pd.Series(dtype="string"))
@@ -284,6 +528,7 @@ def build_match_key(frame: pd.DataFrame) -> pd.Series:
 
 
 def find_new_records(base_df: pd.DataFrame, incoming_df: pd.DataFrame) -> pd.DataFrame:
+    """Return incoming rows with valid key fields that are not already in baseline."""
     base_keys = set(build_match_key(base_df))
     incoming_keys = build_match_key(incoming_df)
 
@@ -301,6 +546,7 @@ def find_new_records(base_df: pd.DataFrame, incoming_df: pd.DataFrame) -> pd.Dat
 
 
 def parse_args() -> argparse.Namespace:
+    """Define CLI options for baseline/source modes and output behavior."""
     parser = argparse.ArgumentParser(
         description=(
             "Find new museum records by comparing an incoming CSV to an existing "
@@ -343,6 +589,13 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    """
+    Orchestrate load -> map -> compare -> export.
+
+    Reading tip: this function is the best high-level summary of script behavior.
+    Testing tip: run this script from terminal using one of the examples in the
+    module docstring and verify the printed counts + output file path.
+    """
     args = parse_args()
 
     base_path = Path(args.base)
