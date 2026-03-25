@@ -222,7 +222,8 @@ It compares an incoming source to baseline `museums.csv` and writes only unseen 
 
 ### What we implemented (important features)
 
-- Multi-source ingestion: local file, direct URL, `catalog.data.gov/dataset/...` page, or `data.gov` search mode.
+- Multi-source ingestion: local file, direct URL, webpage URL with CSV/JSON/ZIP download links, `catalog.data.gov/dataset/...` page, or `data.gov` search mode.
+- Webpage mode includes a numbered chooser so users can select which discovered files to pull.
 - Layered parsing fallback for messy sources: CSV strict -> CSV auto-delimiter -> CSV skip-bad-lines -> JSON -> HTML table.
 - ZIP support: reads CSV/JSON members inside archive sources.
 - Schema mapping paths:
@@ -250,9 +251,13 @@ It compares an incoming source to baseline `museums.csv` and writes only unseen 
 2. Run one of these commands:
 
 - Prompt mode: `python find_new_museum_data.py`
+  - Webpage with download links: `python find_new_museum_data.py --incoming "https://example.org/data-downloads" --output new_museum_records.csv`
 - Known local file: `python find_new_museum_data.py --incoming alternatemuseums.csv --output new_museum_records.csv`
 - Catalog dataset page: `python find_new_museum_data.py --incoming "https://catalog.data.gov/dataset/public-library-survey-pls-2022" --output new_museum_records.csv`
 - Search mode: `python find_new_museum_data.py --search-query "museum dataset" --max-datasets 10 --output new_museum_records.csv`
+- Wikipedia scrape-only dataset mode: `python find_new_museum_data.py --incoming "https://en.wikipedia.org/wiki/List_of_most-visited_museums" --scrape-only-output wikipedia_dataset.csv`
+
+If webpage mode discovers many files, enter file numbers (for example `1,3,5` or `2-4`) to pull only those files, or press Enter to pull all.
 
 1. For unknown schemas, follow prompts:
 
@@ -302,10 +307,101 @@ Use this loop when you change the script and want quick validation:
 ### Key arguments
 
 - `--base`: baseline CSV path (default `museums.csv`)
-- `--incoming`: URL or local path for incoming data
+- `--incoming`: URL or local path for incoming data (including webpage URLs that list downloadable CSV/JSON/ZIP files)
 - `--search-query`: online query for `data.gov` discovery mode
 - `--max-datasets`: max datasets to inspect in search mode
 - `--output`: destination CSV for new records (default `new_museum_records.csv`)
+- `--scrape-only-output`: write a raw scraped dataset CSV directly (no dedupe/mapping), useful for Wikipedia/webpage research datasets
+- `--output-folder`: folder for generated datasets when output names are plain filenames (default `generated_datasets`)
+- `--flat-output-folder`: disable date subfolders and write directly into `--output-folder`
+
+By default, generated files are organized into `generated_datasets/YYYY-MM-DD/` unless you pass an explicit path with a directory.
+
+### Why this logic (and why this is useful)
+
+This section explains not just what the script does, but why it was designed this way.
+
+1. **Two operating modes (incremental vs scrape-only)**
+
+- Incremental mode (`--output`) is for operational workflows: map incoming data to museum schema, compare to baseline, write only new rows.
+- Scrape-only mode (`--scrape-only-output`) is for exploration/research: pull raw tables from web sources (like Wikipedia) and export directly.
+- Why split modes? Because operational dedupe rules and exploratory scraping goals are different, and combining them can cause confusion or silent data loss.
+
+1. **Layered parsing strategy**
+
+- Real-world links are inconsistent: direct CSV, ZIP archives, JSON APIs, or HTML wrapper pages.
+- The script attempts parsing in controlled layers so failure in one format does not end the run prematurely.
+- Why this over a single parser? A single parser is simpler to code but fails frequently in practice.
+
+1. **Interactive selection for discovered files**
+
+- When a page exposes many download links, users choose only relevant files.
+- Why this over auto-pulling everything? Pulling everything can be slow, noisy, and may ingest irrelevant tables.
+
+1. **Interactive schema mapping for unknown structures**
+
+- Unknown columns are mapped with prompts instead of hard-failing.
+- Why this over strict schema-only mode? Strict mode is safer for automation, but it blocks exploratory and public-data workflows.
+
+1. **Date-stamped output folders (`generated_datasets/YYYY-MM-DD/`)**
+
+- Keeps each run grouped by day for reproducibility and auditability.
+- Reduces accidental overwrite risk from repeated experiments.
+- Makes cleanup and review simpler (you can inspect or archive by date).
+- Why this over one flat output folder? Flat folders are simpler, but they make run history harder to track.
+- If you prefer flat output, use `--flat-output-folder`.
+
+### Output-folder examples
+
+- Default dated output:
+  - `python find_new_museum_data.py --incoming alternatemuseums.csv --output new_rows.csv`
+  - Writes to: `generated_datasets/<today>/new_rows.csv`
+- Flat output folder:
+  - `python find_new_museum_data.py --incoming alternatemuseums.csv --output new_rows.csv --flat-output-folder`
+  - Writes to: `generated_datasets/new_rows.csv`
+- Explicit path (always respected):
+  - `python find_new_museum_data.py --incoming alternatemuseums.csv --output exports/my_run/new_rows.csv`
+  - Writes to exactly: `exports/my_run/new_rows.csv`
+
+### Recommended team conventions
+
+Use this baseline policy so everyone on the team produces predictable, reviewable outputs.
+
+1. **File naming pattern**
+
+- Incremental outputs: `<source>_new_rows_<short-purpose>.csv`
+- Scrape-only outputs: `<source>_raw_<topic>.csv`
+- Keep names lowercase with underscores for easier shell usage.
+
+1. **When to use dated folders (default)**
+
+- Use dated folders for experiments, demos, and onboarding runs.
+- Use dated folders when multiple teammates are running the script in the same repo.
+- Benefit: preserves run history and avoids accidental overwrite.
+
+1. **When to use flat output (`--flat-output-folder`)**
+
+- Use flat mode for stable pipelines that always overwrite a canonical output name.
+- Use flat mode only when downstream automation expects one fixed filename.
+
+1. **Retention and cleanup cadence**
+
+- Daily/active work: keep last 3–7 dated run folders.
+- Weekly: archive or delete older dated folders not referenced by reports.
+- Before demo/hand-off: keep one final dated folder and remove temporary test files.
+
+1. **Review checklist before sharing outputs**
+
+- Confirm the run used the expected source URL/path.
+- Confirm row count and column count look reasonable.
+- Confirm folder/date and filename follow team naming pattern.
+- Confirm no temporary test files are included.
+
+### Wikipedia notes
+
+- Wikipedia table scraping requires `lxml` in your Python environment.
+- If a page has multiple tables, the script shows them and lets you choose which table numbers to include.
+- In scrape-only mode, output is a direct dataset export from selected tables.
 
 ### Output contract
 

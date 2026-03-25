@@ -32,11 +32,13 @@ Design notes
 """
 
 import argparse
-from io import BytesIO
+from datetime import date
+from html.parser import HTMLParser
+from io import BytesIO, StringIO
 import json
 from pathlib import Path
-from urllib.parse import quote_plus, urlparse
-from urllib.request import urlopen
+from urllib.parse import parse_qs, quote_plus, urljoin, urlparse
+from urllib.request import Request, urlopen
 from zipfile import ZipFile
 
 import pandas as pd
@@ -54,6 +56,30 @@ ALT_REQUIRED = {
 }
 
 SUPPORTED_RESOURCE_FORMATS = {"csv", "json"}
+SUPPORTED_DOWNLOAD_EXTENSIONS = (".csv", ".json", ".zip")
+DEFAULT_HTTP_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    )
+}
+
+
+class _HrefParser(HTMLParser):
+    """Minimal HTML href extractor for download-link discovery."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.hrefs: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() != "a":
+            return
+        for key, value in attrs:
+            if key.lower() == "href" and value:
+                self.hrefs.append(value)
+                break
 
 
 def normalize_text(series: pd.Series) -> pd.Series:
@@ -205,11 +231,242 @@ def is_url(value: str) -> bool:
     return value.startswith("http://") or value.startswith("https://")
 
 
+def fetch_url_bytes(url: str) -> bytes:
+    """Fetch URL bytes using a browser-like user-agent header."""
+    request = Request(url, headers=DEFAULT_HTTP_HEADERS)
+    with urlopen(request) as response:
+        return response.read()
+
+
+def _looks_like_download_url(url: str) -> bool:
+    """Heuristic: True when URL path/query indicates direct CSV/JSON/ZIP content."""
+    lowered = url.lower()
+    parsed = urlparse(lowered)
+
+    if parsed.path.endswith(SUPPORTED_DOWNLOAD_EXTENSIONS):
+        return True
+
+    query = parse_qs(parsed.query)
+    for key in ("format", "filetype", "type"):
+        values = query.get(key, [])
+        if any(v in {"csv", "json", "zip"} for v in values):
+            return True
+
+    return any(ext in lowered for ext in SUPPORTED_DOWNLOAD_EXTENSIONS)
+
+
+def discover_download_links_from_webpage(page_url: str) -> list[str]:
+    """
+    Discover CSV/JSON/ZIP links from a webpage URL.
+
+    Relative links are resolved using the page URL.
+    """
+    html_bytes = fetch_url_bytes(page_url)
+
+    html_text = html_bytes.decode("utf-8", errors="replace")
+
+    parser = _HrefParser()
+    parser.feed(html_text)
+
+    candidate_links: list[str] = []
+    for href in parser.hrefs:
+        absolute = urljoin(page_url, href)
+        if not is_url(absolute):
+            continue
+        if _looks_like_download_url(absolute):
+            candidate_links.append(absolute)
+
+    # Preserve order and dedupe.
+    return list(dict.fromkeys(candidate_links))
+
+
+def _prompt_select_resource_urls(urls: list[str], label: str) -> list[str]:
+    """
+    Let user choose which discovered resource URLs to pull.
+
+    Input format:
+    - Enter: keep all
+    - Comma list: 1,3,5
+    - Ranges: 1-3,7
+    - q: cancel
+    """
+    if len(urls) <= 1:
+        return urls
+
+    print(f"\n{label} discovered: {len(urls):,}")
+    for idx, resource_url in enumerate(urls, start=1):
+        print(f"  {idx:>3}. {resource_url}")
+
+    print("\nChoose files to pull by number (e.g., 1,3,5 or 1-4).")
+    print("Press Enter to pull all, or type 'q' to cancel.")
+
+    while True:
+        raw = input("Files to pull: ").strip().lower()
+        if raw == "":
+            return urls
+        if raw in {"q", "quit", "exit"}:
+            raise SystemExit("Cancelled by user.")
+
+        try:
+            selected_indexes: list[int] = []
+            for token in raw.split(","):
+                token = token.strip()
+                if not token:
+                    continue
+                if "-" in token:
+                    start_text, end_text = token.split("-", 1)
+                    start = int(start_text.strip())
+                    end = int(end_text.strip())
+                    if start > end:
+                        start, end = end, start
+                    selected_indexes.extend(list(range(start, end + 1)))
+                else:
+                    selected_indexes.append(int(token))
+
+            if not selected_indexes:
+                print("Please choose at least one file index.")
+                continue
+
+            if any(idx < 1 or idx > len(urls) for idx in selected_indexes):
+                print("One or more selections are out of range. Try again.")
+                continue
+
+            selected_urls = [urls[idx - 1] for idx in selected_indexes]
+            return list(dict.fromkeys(selected_urls))
+        except ValueError:
+            print("Invalid selection format. Use values like 1,3,5 or 1-4.")
+
+
+def _parse_index_selection(raw: str, max_size: int) -> list[int]:
+    """Parse index selections like '1,3,5' or '2-4' into 1-based indexes."""
+    selected_indexes: list[int] = []
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if "-" in token:
+            start_text, end_text = token.split("-", 1)
+            start = int(start_text.strip())
+            end = int(end_text.strip())
+            if start > end:
+                start, end = end, start
+            selected_indexes.extend(list(range(start, end + 1)))
+        else:
+            selected_indexes.append(int(token))
+
+    if not selected_indexes:
+        raise ValueError("No selections provided.")
+    if any(idx < 1 or idx > max_size for idx in selected_indexes):
+        raise ValueError("Selection out of range.")
+
+    # Preserve order while deduplicating.
+    return list(dict.fromkeys(selected_indexes))
+
+
+def _is_wikipedia_url(url: str) -> bool:
+    """Return True when URL host belongs to Wikipedia."""
+    if not is_url(url):
+        return False
+    return "wikipedia.org" in urlparse(url).netloc.lower()
+
+
+def scrape_wikipedia_tables(page_url: str) -> pd.DataFrame:
+    """
+    Scrape tabular data from a Wikipedia page and let user choose tables.
+
+    Returns a combined DataFrame from selected table(s).
+    """
+    html_bytes = fetch_url_bytes(page_url)
+    html_text = html_bytes.decode("utf-8", errors="replace")
+    tables = pd.read_html(StringIO(html_text))
+    non_empty_tables = [table for table in tables if not table.empty]
+
+    if not non_empty_tables:
+        raise ValueError(f"No non-empty HTML tables were found on: {page_url}")
+
+    print(f"\nWikipedia tables found: {len(non_empty_tables):,}")
+    for idx, table in enumerate(non_empty_tables, start=1):
+        preview_cols = [str(col) for col in list(table.columns)[:6]]
+        print(f"  {idx:>3}. rows={len(table):,}, cols={len(table.columns):,}, sample_cols={preview_cols}")
+
+    if len(non_empty_tables) == 1:
+        selected_tables = [non_empty_tables[0]]
+    else:
+        print("\nChoose table numbers to use (e.g., 1,3 or 2-4).")
+        print("Press Enter to use table 1, or type 'q' to cancel.")
+        while True:
+            raw = input("Tables to use: ").strip().lower()
+            if raw == "":
+                selected_tables = [non_empty_tables[0]]
+                break
+            if raw in {"q", "quit", "exit"}:
+                raise SystemExit("Cancelled by user.")
+            try:
+                selected_indexes = _parse_index_selection(raw, len(non_empty_tables))
+                selected_tables = [non_empty_tables[idx - 1] for idx in selected_indexes]
+                break
+            except ValueError:
+                print("Invalid selection format. Use values like 1,3 or 2-4.")
+
+    combined = pd.concat(selected_tables, ignore_index=True, sort=False)
+    print(f"Wikipedia tables selected: {len(selected_tables):,}")
+    print(f"Wikipedia combined rows: {len(combined):,}")
+    return combined
+
+
+def load_raw_from_resource_urls(urls: list[str], label: str) -> pd.DataFrame:
+    """Load raw tables from resource URLs and combine successful parses."""
+    frames: list[pd.DataFrame] = []
+    skipped = 0
+
+    for resource_url in urls:
+        try:
+            frame = read_table(resource_url)
+            if not frame.empty:
+                frames.append(frame)
+            else:
+                skipped += 1
+        except Exception:
+            skipped += 1
+
+    if not frames:
+        raise ValueError(f"{label} were discovered, but none could be parsed.")
+
+    combined = pd.concat(frames, ignore_index=True, sort=False)
+    print(f"{label} found: {len(urls):,}")
+    print(f"{label} used: {len(frames):,}")
+    print(f"{label} skipped: {skipped:,}")
+    return combined
+
+
+def load_and_map_from_resource_urls(urls: list[str], label: str) -> pd.DataFrame:
+    """Load and map a list of resource URLs, combining successful parses."""
+    mapped_frames: list[pd.DataFrame] = []
+    skipped = 0
+
+    for resource_url in urls:
+        try:
+            frame = read_table(resource_url)
+            mapped_frames.append(map_incoming_frame(frame))
+        except Exception:
+            skipped += 1
+
+    if not mapped_frames:
+        raise ValueError(
+            f"{label} were discovered, but none matched supported museum schemas."
+        )
+
+    combined = pd.concat(mapped_frames, ignore_index=True, sort=False)
+    print(f"{label} found: {len(urls):,}")
+    print(f"{label} used: {len(mapped_frames):,}")
+    print(f"{label} skipped: {skipped:,}")
+    return combined
+
+
 def read_zip_source(source: str) -> pd.DataFrame:
     """Read ZIP source and parse first usable CSV/JSON member(s)."""
     if is_url(source):
-        with urlopen(source) as response:
-            zip_bytes = response.read()
+        zip_bytes = fetch_url_bytes(source)
     else:
         zip_bytes = Path(source).read_bytes()
 
@@ -222,15 +479,29 @@ def read_zip_source(source: str) -> pd.DataFrame:
         json_members = [name for name in members if name.lower().endswith(".json")]
 
         parsed_frames: list[pd.DataFrame] = []
+        csv_encodings = ["utf-8", "utf-8-sig", "cp1252", "latin-1"]
 
         for member in csv_members:
-            try:
-                with zf.open(member) as fh:
-                    frame = pd.read_csv(fh, low_memory=False)
-                if not frame.empty:
-                    parsed_frames.append(frame)
-            except Exception as exc:
-                parse_errors.append(f"{member}: {exc}")
+            member_error: str | None = None
+            with zf.open(member) as fh:
+                raw_bytes = fh.read()
+
+            for encoding in csv_encodings:
+                try:
+                    frame = pd.read_csv(
+                        BytesIO(raw_bytes),
+                        low_memory=False,
+                        encoding=encoding,
+                    )
+                    if not frame.empty:
+                        parsed_frames.append(frame)
+                    member_error = None
+                    break
+                except Exception as exc:
+                    member_error = f"{member} [encoding={encoding}]: {exc}"
+
+            if member_error:
+                parse_errors.append(member_error)
 
         if parsed_frames:
             combined = pd.concat(parsed_frames, ignore_index=True, sort=False)
@@ -324,8 +595,7 @@ def search_data_gov_resources(query: str, max_datasets: int) -> list[str]:
         f"?q={quote_plus(query)}&rows={max_datasets}"
     )
 
-    with urlopen(api_url) as response:
-        payload = json.loads(response.read().decode("utf-8"))
+    payload = json.loads(fetch_url_bytes(api_url).decode("utf-8"))
 
     if not payload.get("success"):
         raise ValueError("data.gov search API returned an unsuccessful response.")
@@ -365,8 +635,7 @@ def resources_from_data_gov_dataset_id(dataset_id: str) -> list[str]:
         f"?id={quote_plus(dataset_id)}"
     )
 
-    with urlopen(api_url) as response:
-        payload = json.loads(response.read().decode("utf-8"))
+    payload = json.loads(fetch_url_bytes(api_url).decode("utf-8"))
 
     if not payload.get("success"):
         raise ValueError(
@@ -397,25 +666,7 @@ def load_and_map_from_data_gov_dataset_url(dataset_url: str) -> pd.DataFrame:
             "No CSV/JSON resources were found for this catalog.data.gov dataset page."
         )
 
-    mapped_frames: list[pd.DataFrame] = []
-    skipped = 0
-
-    for resource_url in urls:
-        try:
-            mapped_frames.append(load_and_map_incoming_source(resource_url))
-        except Exception:
-            skipped += 1
-
-    if not mapped_frames:
-        raise ValueError(
-            "Dataset resources were discovered, but none matched supported museum schemas."
-        )
-
-    combined = pd.concat(mapped_frames, ignore_index=True, sort=False)
-    print(f"Dataset resources found: {len(urls):,}")
-    print(f"Dataset resources used: {len(mapped_frames):,}")
-    print(f"Dataset resources skipped: {skipped:,}")
-    return combined
+    return load_and_map_from_resource_urls(urls, label="Dataset resources")
 
 
 def load_standard(path: Path) -> pd.DataFrame:
@@ -468,8 +719,90 @@ def load_and_map_incoming_source(source: str) -> pd.DataFrame:
     if dataset_id:
         return load_and_map_from_data_gov_dataset_url(source)
 
+    # If this is a webpage URL (not a direct data file), discover downloadable resources.
+    if is_url(source) and not _looks_like_download_url(source):
+        discovered_links = discover_download_links_from_webpage(source)
+        if discovered_links:
+            chosen_links = _prompt_select_resource_urls(
+                discovered_links,
+                label="Webpage download links",
+            )
+            return load_and_map_from_resource_urls(
+                chosen_links,
+                label="Webpage download links",
+            )
+
     frame = read_table(source)
     return map_incoming_frame(frame)
+
+
+def load_raw_incoming_source(source: str) -> pd.DataFrame:
+    """
+    Load one source as a raw dataset without applying museum schema mapping.
+
+    Useful for scrape-only workflows (e.g., Wikipedia dataset creation).
+    """
+    dataset_id = extract_dataset_id_from_data_gov_url(source) if is_url(source) else None
+    if dataset_id:
+        urls = resources_from_data_gov_dataset_id(dataset_id)
+        if not urls:
+            raise ValueError(
+                "No CSV/JSON resources were found for this catalog.data.gov dataset page."
+            )
+        return load_raw_from_resource_urls(urls, label="Dataset resources")
+
+    if is_url(source) and _is_wikipedia_url(source):
+        return scrape_wikipedia_tables(source)
+
+    if is_url(source) and not _looks_like_download_url(source):
+        discovered_links = discover_download_links_from_webpage(source)
+        if discovered_links:
+            chosen_links = _prompt_select_resource_urls(
+                discovered_links,
+                label="Webpage download links",
+            )
+            return load_raw_from_resource_urls(
+                chosen_links,
+                label="Webpage download links",
+            )
+
+    return read_table(source)
+
+
+def build_output_path(
+    file_name_or_path: str,
+    output_folder: str,
+    use_dated_subfolder: bool,
+) -> Path:
+    """
+    Build an output path for generated datasets.
+
+        Behavior:
+    - If caller passes a plain filename (no directory), file is placed in
+      output_folder/YYYY-MM-DD/filename.
+    - If caller passes a path with a directory (or absolute path), that explicit path is used.
+
+    Why this design:
+    - Date-based folders make repeated runs easy to audit and compare.
+    - We avoid accidental overwrites from multiple experiments in one day.
+    - Explicit paths still win when callers need full control.
+    """
+    raw_path = Path(file_name_or_path)
+
+    # Respect explicit user intent first: absolute/relative-with-folder paths
+    # should not be rewritten.
+    if raw_path.is_absolute() or raw_path.parent != Path("."):
+        final_path = raw_path
+    else:
+        # For plain filenames, organize outputs by run date for easy review,
+        # traceability, and low-friction cleanup.
+        run_folder = Path(output_folder)
+        if use_dated_subfolder:
+            run_folder = run_folder / date.today().isoformat()
+        final_path = run_folder / raw_path
+
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    return final_path
 
 
 def load_and_map_from_data_gov_search(query: str, max_datasets: int) -> pd.DataFrame:
@@ -478,25 +811,7 @@ def load_and_map_from_data_gov_search(query: str, max_datasets: int) -> pd.DataF
     if not urls:
         raise ValueError("No CSV/JSON resources found from data.gov search results.")
 
-    mapped_frames: list[pd.DataFrame] = []
-    skipped = 0
-
-    for url in urls:
-        try:
-            mapped_frames.append(load_and_map_incoming_source(url))
-        except Exception:
-            skipped += 1
-
-    if not mapped_frames:
-        raise ValueError(
-            "Resources were found online, but none matched supported museum schemas."
-        )
-
-    combined = pd.concat(mapped_frames, ignore_index=True, sort=False)
-    print(f"Online resources found: {len(urls):,}")
-    print(f"Online resources used: {len(mapped_frames):,}")
-    print(f"Online resources skipped: {skipped:,}")
-    return combined
+    return load_and_map_from_resource_urls(urls, label="Online resources")
 
 
 def prompt_for_incoming_source() -> str:
@@ -563,7 +878,8 @@ def parse_args() -> argparse.Namespace:
         default="",
         help=(
             "Path or URL to incoming museum-like data. Supports museums.csv schema or "
-            "alternatemuseums.csv schema. If omitted, you will be prompted."
+            "alternatemuseums.csv schema. Can also be a webpage URL containing CSV/JSON/ZIP "
+            "download links. If omitted, you will be prompted."
         ),
     )
     parser.add_argument(
@@ -585,6 +901,30 @@ def parse_args() -> argparse.Namespace:
         default="new_museum_records.csv",
         help="Path to output CSV for new records (default: new_museum_records.csv)",
     )
+    parser.add_argument(
+        "--output-folder",
+        default="generated_datasets",
+        help=(
+            "Folder used for generated datasets when output args are plain filenames "
+            "(default: generated_datasets, with date-based subfolders unless disabled)."
+        ),
+    )
+    parser.add_argument(
+        "--flat-output-folder",
+        action="store_true",
+        help=(
+            "Disable date-based subfolders and write plain-filename outputs directly "
+            "inside --output-folder."
+        ),
+    )
+    parser.add_argument(
+        "--scrape-only-output",
+        default="",
+        help=(
+            "Optional path to write a raw scraped dataset (no dedupe/museum mapping). "
+            "Works well for Wikipedia pages and webpage download indexes."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -598,9 +938,33 @@ def main() -> None:
     """
     args = parse_args()
 
-    base_path = Path(args.base)
-    output_path = Path(args.output)
+    # Configure output strategy once so every write path follows the same rule.
+    use_dated_subfolder = not args.flat_output_folder
 
+    output_path = build_output_path(
+        args.output,
+        args.output_folder,
+        use_dated_subfolder=use_dated_subfolder,
+    )
+
+    # Mode A: scrape-only dataset creation (no museum mapping/dedupe).
+    if args.scrape_only_output.strip():
+        incoming_source = args.incoming.strip() or prompt_for_incoming_source()
+        raw_df = load_raw_incoming_source(incoming_source)
+        scrape_output_path = build_output_path(
+            args.scrape_only_output.strip(),
+            args.output_folder,
+            use_dated_subfolder=use_dated_subfolder,
+        )
+        raw_df.to_csv(scrape_output_path, index=False)
+        print(f"Incoming source: {incoming_source}")
+        print(f"Raw scraped rows: {len(raw_df):,}")
+        print(f"Raw scraped columns: {len(raw_df.columns):,}")
+        print(f"Scrape-only output file: {scrape_output_path.resolve()}")
+        return
+
+    # Mode B: museum-incremental mode (map -> compare -> write only new rows).
+    base_path = Path(args.base)
     base_df = load_standard(base_path)
 
     if args.search_query.strip():
