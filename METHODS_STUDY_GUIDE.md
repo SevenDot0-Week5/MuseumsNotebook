@@ -9,6 +9,13 @@
 - **Key assumption:** alternate-source records are mapped into the main schema and may use placeholders (`NA`, `Unknown Address`, `NaT`) when source values are missing.
 - **Common pitfall:** if widgets or plots do not render, rerun setup cells from top to bottom after installing dependencies.
 
+## Team quick talk track (60 seconds)
+
+We built two connected pieces: a resilient analysis notebook and a companion ingestion script.
+The notebook standardizes mixed museum data, surfaces missingness early, and keeps charts/tables running even with imperfect inputs.
+The script handles local files, direct URLs, `catalog.data.gov` dataset pages, and search-based `data.gov` discovery, then writes only new records compared with baseline.
+The design goal was reliability + explainability: clear schema mapping, explicit quality checks, and simple duplicate logic the team can reason about.
+
 ## Goal
 
 This guide explains the methods used in `MuseumNotes_combined.ipynb` so you can study both **what** each stage does and **why** it is done that way.
@@ -157,75 +164,108 @@ You can trace a row from raw input -> cleaned/mapped schema -> `clean_copy` -> g
 
 ## 12) Companion script guide: finding new records and writing a CSV
 
-The project now includes `find_new_museum_data.py` for detecting **new museum records** relative to `museums.csv` and exporting them to a separate CSV.
+The project includes `find_new_museum_data.py` to detect **new museum records** relative to baseline `museums.csv` and export only new rows.
 
-### What the script does (plain language)
+### What the script does
 
-1. Loads your baseline museum dataset (`museums.csv`).
-2. Gets incoming data from one of three sources:
+1. Loads baseline data from `museums.csv` (or `--base`).
+2. Ingests incoming data from one of these sources:
 
-- a local path,
-- a direct URL,
-- or an internet `data.gov` search query.
+- local path,
+- direct URL,
+- `catalog.data.gov/dataset/...` dataset page URL,
+- or `data.gov` search query mode.
 
-1. Maps incoming data into a compatible museum schema when needed.
-2. Builds a normalized match key from `Museum Name + State (Administrative Location`.
-3. Keeps only rows that are valid and not already in baseline.
-4. Writes those rows to a new CSV.
+1. Maps incoming records into supported schema.
 
-### Input modes you can use
+2. Builds duplicate key: `Museum Name + State (Administrative Location)` (normalized case/whitespace).
 
-- **Interactive prompt mode** (asks user for URL/path):
-- `python find_new_museum_data.py`
-- **Direct incoming source mode**:
-- `python find_new_museum_data.py --incoming "https://example.org/museums.csv"`
-- `python find_new_museum_data.py --incoming alternatemuseums.csv`
-- **Internet search mode (`data.gov`)**:
-- `python find_new_museum_data.py --search-query "museum dataset" --max-datasets 10`
+3. Keeps only rows with required key fields that are not already in baseline.
 
-### Important arguments
+4. Writes new rows to output CSV.
 
-- `--base`: baseline CSV to compare against (default: `museums.csv`)
-- `--incoming`: URL or local file path for incoming data
-- `--search-query`: query string for online search (uses `data.gov` API)
-- `--max-datasets`: cap on online datasets checked in search mode
-- `--output`: output CSV path for newly detected records (default: `new_museum_records.csv`)
+### Input modes
 
-### Schema support details
+- **Prompt mode (asks for URL/path):** `python find_new_museum_data.py`
+- **Direct incoming source:** `python find_new_museum_data.py --incoming "https://example.org/museums.csv"`
+- **Catalog dataset page URL:**
+`python find_new_museum_data.py --incoming "https://catalog.data.gov/dataset/public-library-survey-pls-2022"`
+- **Search mode (`data.gov` API):**
+`python find_new_museum_data.py --search-query "museum dataset" --max-datasets 10`
 
-The script supports two incoming schemas:
+### Key arguments
 
-1. **museums-style schema** (already includes columns like `Museum Name` and `State (Administrative Location)`).
-2. **alternate DC schema** (columns like `DCGISPLACE_NAMES_PTNAME`, `DCGISADDRESSES_PTADDRESS`, `MARVW_PLACE_NAME_CATEGORIESCATEGORY`) which are mapped into museums-style columns.
+- `--base`: baseline CSV path (default `museums.csv`)
+- `--incoming`: URL or local path for incoming data
+- `--search-query`: online query for `data.gov` dataset discovery
+- `--max-datasets`: max datasets to inspect in search mode
+- `--output`: destination CSV for new records (default `new_museum_records.csv`)
 
-If neither schema matches, the script stops with a clear schema error.
+### Schema + parsing behavior
 
-### How duplicate detection works
+- Supported incoming schemas:
+- museums-style schema (has `Museum Name` and `State (Administrative Location)`),
+- alternate DC schema (`DCGISPLACE_NAMES_PTNAME`, `DCGISADDRESSES_PTADDRESS`, `MARVW_PLACE_NAME_CATEGORIESCATEGORY`).
+- For non-raw URLs and messy files, parser attempts are layered:
+- CSV (strict),
+- CSV (auto delimiter),
+- CSV (auto delimiter + skip bad lines),
+- JSON,
+- HTML table extraction.
+- If all attempts fail, script returns a detailed parse diagnostic.
 
-- Matching key: uppercase/trimmed `Museum Name` + `State (Administrative Location)`.
-- A row is treated as new only if:
-- both key parts are present, and
-- the combined key does not exist in baseline.
+### Catalog.data.gov page support
 
-### Output behavior
+- If `--incoming` is a `catalog.data.gov/dataset/...` page URL, the script:
 
-- The script always writes a CSV (possibly empty if no new rows are found).
-- It prints a summary with:
-- baseline row count,
-- incoming source and incoming row count,
-- number of new rows written,
-- output file location.
+1. extracts dataset id,
+2. calls CKAN `package_show`,
+3. collects CSV/JSON resource URLs,
+4. processes those resources through the same schema mapping + dedupe flow.
 
-### Engineering notes and caveats
+### What gets written
 
-- `data.gov` search mode may find many resources; only CSV/JSON resources are attempted.
-- Some online resources will be skipped if schema is incompatible.
-- Network/API availability affects online modes.
-- Current dedupe key is intentionally simple and explainable; for production, consider stronger matching (address + fuzzy name + geocode).
+- Output CSV contains only rows that:
+- have non-empty normalized `Museum Name` and `State (Administrative Location)`, and
+- are not already in baseline by normalized key.
+- Script prints baseline count, incoming source label, incoming row count, new-row count, and output location.
+
+### Practical caveats
+
+- Many online datasets are non-museum schemas; those resources are skipped.
+- Network/API instability can affect URL and search modes.
+- Duplicate detection is intentionally simple for explainability; production matching can extend keying with address/fuzzy matching.
 
 ### Troubleshooting quick list
 
-- **No results written:** verify incoming source has valid museum names and state values.
-- **Schema error:** check whether incoming columns match one of the two supported schemas.
-- **URL fails:** open URL in browser to verify it is accessible and not blocked.
-- **Search mode sparse:** increase `--max-datasets` or improve `--search-query` keywords.
+- **No new rows:** incoming records may already exist in baseline or key fields may be empty.
+- **Schema not recognized:** incoming columns do not match supported schemas.
+- **Page URL parse issue:** confirm URL is a dataset page and resources are public.
+- **Sparse search results:** tune `--search-query` and increase `--max-datasets`.
+
+## 13) 2-minute live demo script (say this in the meeting)
+
+### A. Open (15–20 seconds)
+
+"We built this in two layers: a notebook for robust analysis and a script for incremental ingestion. The notebook handles cleaning and interpretation; the script finds only new records and writes a clean CSV for downstream work."
+
+### B. Why we designed it this way (20–30 seconds)
+
+"We wanted resilience and transparency. Data comes in different shapes and with missing values, so we made schema mapping explicit, added missing-data alerts, and used safe parsing so bad values become `NA`/`NaT` instead of breaking execution."
+
+### C. Live command demo (40–50 seconds)
+
+Run one of these:
+
+- Prompt mode:
+- `python find_new_museum_data.py`
+- Catalog dataset page mode:
+- `python find_new_museum_data.py --incoming "https://catalog.data.gov/dataset/public-library-survey-pls-2022" --output new_museum_records.csv`
+
+Then narrate:
+
+"The script resolves the source, maps supported schemas, compares incoming rows to baseline using normalized museum name + state, and writes only unseen rows. It prints baseline count, incoming count, new-row count, and output location."
+
+### D. Close (15–20 seconds)
+
+"So the value is: less manual cleanup, clearer quality visibility, and a repeatable process that engineers can automate and analysts can trust."

@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlparse
 from urllib.request import urlopen
 
 import pandas as pd
@@ -42,13 +42,49 @@ def read_table(source: str) -> pd.DataFrame:
     if source_lower.endswith(".json"):
         return pd.read_json(source)
 
-    if source_lower.endswith(".csv"):
-        return pd.read_csv(source, low_memory=False)
+    csv_attempt_errors: list[str] = []
+
+    csv_attempts = [
+        {"low_memory": False},
+        {"low_memory": False, "engine": "python", "sep": None},
+        {
+            "low_memory": False,
+            "engine": "python",
+            "sep": None,
+            "on_bad_lines": "skip",
+        },
+    ]
+
+    for kwargs in csv_attempts:
+        try:
+            frame = pd.read_csv(source, **kwargs)
+            if frame.empty:
+                continue
+            return frame
+        except Exception as exc:
+            csv_attempt_errors.append(f"read_csv{kwargs} -> {exc}")
 
     try:
-        return pd.read_csv(source, low_memory=False)
-    except Exception:
-        return pd.read_json(source)
+        frame = pd.read_json(source)
+        if not frame.empty:
+            return frame
+    except Exception as exc:
+        csv_attempt_errors.append(f"read_json -> {exc}")
+
+    try:
+        html_tables = pd.read_html(source)
+        if html_tables:
+            return html_tables[0]
+    except Exception as exc:
+        csv_attempt_errors.append(f"read_html -> {exc}")
+
+    error_summary = "\n- " + "\n- ".join(csv_attempt_errors[:6])
+    raise ValueError(
+        "Could not parse incoming source as CSV, JSON, or HTML table. "
+        "This often means the URL points to a webpage/download wrapper instead of raw data."
+        f"\nSource: {source}"
+        f"\nAttempts:{error_summary}"
+    )
 
 
 def search_data_gov_resources(query: str, max_datasets: int) -> list[str]:
@@ -74,6 +110,78 @@ def search_data_gov_resources(query: str, max_datasets: int) -> list[str]:
                 resource_urls.append(url)
 
     return resource_urls
+
+
+def extract_dataset_id_from_data_gov_url(url: str) -> str | None:
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    path_parts = [part for part in parsed.path.strip("/").split("/") if part]
+
+    if "catalog.data.gov" not in host:
+        return None
+
+    if len(path_parts) >= 2 and path_parts[0] == "dataset":
+        return path_parts[1]
+
+    return None
+
+
+def resources_from_data_gov_dataset_id(dataset_id: str) -> list[str]:
+    api_url = (
+        "https://catalog.data.gov/api/3/action/package_show"
+        f"?id={quote_plus(dataset_id)}"
+    )
+
+    with urlopen(api_url) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+
+    if not payload.get("success"):
+        raise ValueError(
+            f"data.gov package_show API returned unsuccessful response for dataset: {dataset_id}"
+        )
+
+    dataset = payload.get("result", {})
+    resource_urls: list[str] = []
+
+    for resource in dataset.get("resources", []):
+        fmt = str(resource.get("format", "")).strip().lower()
+        url = resource.get("url")
+        if fmt in SUPPORTED_RESOURCE_FORMATS and isinstance(url, str) and url:
+            resource_urls.append(url)
+
+    return resource_urls
+
+
+def load_and_map_from_data_gov_dataset_url(dataset_url: str) -> pd.DataFrame:
+    dataset_id = extract_dataset_id_from_data_gov_url(dataset_url)
+    if not dataset_id:
+        raise ValueError(f"Could not extract dataset id from URL: {dataset_url}")
+
+    urls = resources_from_data_gov_dataset_id(dataset_id)
+    if not urls:
+        raise ValueError(
+            "No CSV/JSON resources were found for this catalog.data.gov dataset page."
+        )
+
+    mapped_frames: list[pd.DataFrame] = []
+    skipped = 0
+
+    for resource_url in urls:
+        try:
+            mapped_frames.append(load_and_map_incoming_source(resource_url))
+        except Exception:
+            skipped += 1
+
+    if not mapped_frames:
+        raise ValueError(
+            "Dataset resources were discovered, but none matched supported museum schemas."
+        )
+
+    combined = pd.concat(mapped_frames, ignore_index=True, sort=False)
+    print(f"Dataset resources found: {len(urls):,}")
+    print(f"Dataset resources used: {len(mapped_frames):,}")
+    print(f"Dataset resources skipped: {skipped:,}")
+    return combined
 
 
 def load_standard(path: Path) -> pd.DataFrame:
@@ -115,6 +223,10 @@ def map_incoming_frame(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 def load_and_map_incoming_source(source: str) -> pd.DataFrame:
+    dataset_id = extract_dataset_id_from_data_gov_url(source) if is_url(source) else None
+    if dataset_id:
+        return load_and_map_from_data_gov_dataset_url(source)
+
     frame = read_table(source)
     return map_incoming_frame(frame)
 
@@ -150,6 +262,7 @@ def prompt_for_incoming_source() -> str:
     print("Enter a URL (preferred) or a local file path for incoming museum data.")
     print("Examples:")
     print("- https://example.org/museums.csv")
+    print("- https://catalog.data.gov/dataset/public-library-survey-pls-2022")
     print("- alternatemuseums.csv")
 
     while True:
