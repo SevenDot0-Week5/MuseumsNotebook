@@ -154,3 +154,78 @@ Use this section after reading the notebook to confirm understanding.
 ### D. What “good understanding” looks like
 
 You can trace a row from raw input -> cleaned/mapped schema -> `clean_copy` -> grouped summary -> chart, and explain each transformation and its purpose.
+
+## 12) Companion script guide: finding new records and writing a CSV
+
+The project now includes `find_new_museum_data.py` for detecting **new museum records** relative to `museums.csv` and exporting them to a separate CSV.
+
+### What the script does (plain language)
+
+1. Loads your baseline museum dataset (`museums.csv`).
+2. Gets incoming data from one of three sources:
+
+- a local path,
+- a direct URL,
+- or an internet `data.gov` search query.
+
+1. Maps incoming data into a compatible museum schema when needed.
+2. Builds a normalized match key from `Museum Name + State (Administrative Location`.
+3. Keeps only rows that are valid and not already in baseline.
+4. Writes those rows to a new CSV.
+
+### Input modes you can use
+
+- **Interactive prompt mode** (asks user for URL/path):
+- `python find_new_museum_data.py`
+- **Direct incoming source mode**:
+- `python find_new_museum_data.py --incoming "https://example.org/museums.csv"`
+- `python find_new_museum_data.py --incoming alternatemuseums.csv`
+- **Internet search mode (`data.gov`)**:
+- `python find_new_museum_data.py --search-query "museum dataset" --max-datasets 10`
+
+### Important arguments
+
+- `--base`: baseline CSV to compare against (default: `museums.csv`)
+- `--incoming`: URL or local file path for incoming data
+- `--search-query`: query string for online search (uses `data.gov` API)
+- `--max-datasets`: cap on online datasets checked in search mode
+- `--output`: output CSV path for newly detected records (default: `new_museum_records.csv`)
+
+### Schema support details
+
+The script supports two incoming schemas:
+
+1. **museums-style schema** (already includes columns like `Museum Name` and `State (Administrative Location)`).
+2. **alternate DC schema** (columns like `DCGISPLACE_NAMES_PTNAME`, `DCGISADDRESSES_PTADDRESS`, `MARVW_PLACE_NAME_CATEGORIESCATEGORY`) which are mapped into museums-style columns.
+
+If neither schema matches, the script stops with a clear schema error.
+
+### How duplicate detection works
+
+- Matching key: uppercase/trimmed `Museum Name` + `State (Administrative Location)`.
+- A row is treated as new only if:
+- both key parts are present, and
+- the combined key does not exist in baseline.
+
+### Output behavior
+
+- The script always writes a CSV (possibly empty if no new rows are found).
+- It prints a summary with:
+- baseline row count,
+- incoming source and incoming row count,
+- number of new rows written,
+- output file location.
+
+### Engineering notes and caveats
+
+- `data.gov` search mode may find many resources; only CSV/JSON resources are attempted.
+- Some online resources will be skipped if schema is incompatible.
+- Network/API availability affects online modes.
+- Current dedupe key is intentionally simple and explainable; for production, consider stronger matching (address + fuzzy name + geocode).
+
+### Troubleshooting quick list
+
+- **No results written:** verify incoming source has valid museum names and state values.
+- **Schema error:** check whether incoming columns match one of the two supported schemas.
+- **URL fails:** open URL in browser to verify it is accessible and not blocked.
+- **Search mode sparse:** increase `--max-datasets` or improve `--search-query` keywords.
